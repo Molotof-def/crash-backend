@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 conn = sqlite3.connect("casino.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# Создаем таблицы для пользователей и истории краша
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -19,22 +21,30 @@ cursor.execute("""
         avatar TEXT DEFAULT '👤'
     )
 """)
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS crash_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        multiplier REAL,
+        timestamp INTEGER
+    )
+""")
 conn.commit()
 
-# Проверяем и добавляем новые колонки if not exist
-try:
-    cursor.execute("ALTER TABLE users ADD COLUMN user_name TEXT DEFAULT 'Игрок'")
-    cursor.execute("ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT '👤'")
+def save_crash_result(mult: float):
+    cursor.execute("INSERT INTO crash_history (multiplier, timestamp) VALUES (?, ?)", (mult, int(time.time())))
     conn.commit()
-except:
-    pass
+
+def get_recent_history(limit=50):
+    cursor.execute("SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    return [r[0] for r in rows]
 
 def get_or_create_user(user_id: int, user_name: str = None, avatar: str = None):
     cursor.execute("SELECT balance, inventory, last_daily, user_name, avatar FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     if row:
         b, inv, ld, un, av = row[0], json.loads(row[1]), row[2], row[3], row[4]
-        # Обновляем профиль при входе если передали новые данные
         if user_name or avatar:
             un = user_name or un
             av = avatar or av
@@ -133,6 +143,8 @@ async def crash_loop():
             if current_mult >= game.target_crash:
                 game.multiplier = game.target_crash
                 game.state = "crashed"
+                save_crash_result(game.target_crash)  # Запись раунда в БД
+                
                 for uid, bet in game.active_bets.items():
                     if bet["status"] == "playing":
                         bet["status"] = "crashed"
@@ -150,7 +162,13 @@ async def crash_loop():
                             await game.connections[uid].send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                             await game.connections[uid].send_json({"type": "notify", "msg": f"🎯 Автовывод на {bet['auto_cashout']}x! (+{win_amount} ⭐️)"})
 
-            await broadcast({"type": "state_update", "state": game.state, "multiplier": game.multiplier, "bets": game.active_bets})
+            await broadcast({
+                "type": "state_update", 
+                "state": game.state, 
+                "multiplier": game.multiplier, 
+                "bets": game.active_bets,
+                "history": get_recent_history()
+            })
             if game.state == "crashed":
                 break
             await asyncio.sleep(0.15)
@@ -221,13 +239,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.send_json({"type": "userData", "balance": balance, "inventory": inventory})
     await websocket.send_json({"type": "chat_history", "messages": game.chat_messages})
     await websocket.send_json({"type": "leaderboard", "data": get_leaderboard()})
+    await websocket.send_json({"type": "crash_history_init", "history": get_recent_history()})
     
     try:
         while True:
             data = await websocket.receive_json()
             action = data.get("action")
             
-            # Обновление профиля при получении имени
             user_name = data.get("user_name", u_name)
             avatar = data.get("avatar", u_ava)
             if user_name != u_name or avatar != u_ava:
@@ -341,7 +359,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     hours = left // 3600
                     await websocket.send_json({"type": "notify", "msg": f"⏳ Бонус станет доступен через {hours} ч."})
 
-            # ФИКС ПРОМОКОДОВ (ПРИВОДИМ К НИЖНЕМУ РЕГИСТРУ)
             elif action == "use_promo":
                 code = data.get("code", "").strip().lower()
                 bal, inv, ld, _, _ = get_or_create_user(user_id)
