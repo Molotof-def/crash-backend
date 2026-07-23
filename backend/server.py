@@ -53,20 +53,18 @@ app.add_middleware(
 
 class GameState:
     def __init__(self):
-        # Краш
         self.state = "idle"
         self.multiplier = 1.0
         self.target_crash = 1.0
         self.active_bets = {}
         
-        # Общие сервисы
         self.connections = {} 
         self.mines_games = {}
         self.chat_messages = []
         
-        # PvP Рулетка (Jackpot)
-        self.jackpot_state = "idle" # 'idle', 'spinning', 'ended'
-        self.jackpot_bets = {}      # { user_id: { amount, user_name, avatar } }
+        # PvP Арена Шайба
+        self.jackpot_state = "idle"
+        self.jackpot_bets = {}      
         self.jackpot_timer = 15
         self.jackpot_winner = None
         self.jackpot_win_degree = 0
@@ -89,7 +87,6 @@ async def broadcast(message: dict):
         except:
             pass
 
-# --- ЦИКЛ КРАША ---
 async def crash_loop():
     while True:
         game.state = "idle"
@@ -124,7 +121,6 @@ async def crash_loop():
                         bal, inv, ld = get_or_create_user(uid)
                         new_bal = bal + win_amount
                         update_user_data(uid, balance=new_bal)
-                        
                         bet["status"] = "cashed_out"
                         bet["win"] = win_amount
                         if uid in game.connections:
@@ -138,21 +134,18 @@ async def crash_loop():
 
         await asyncio.sleep(2.5)
 
-# --- ЦИКЛ PVP РУЛЕТКИ (JACKPOT) ---
 async def jackpot_loop():
     while True:
         if game.jackpot_state == "idle":
-            if len(game.jackpot_bets) >= 2: # Начинаем отсчет от 2 игроков
+            if len(game.jackpot_bets) >= 2:
                 for t in range(15, -1, -1):
                     game.jackpot_timer = t
                     await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": t})
                     await asyncio.sleep(1)
                 
-                # Запуск вращения
                 game.jackpot_state = "spinning"
                 total_pot = sum(b["amount"] for b in game.jackpot_bets.values())
                 
-                # Выбор победителя по рулетке (рулетка взвешенная)
                 pick = random.randint(1, total_pot)
                 current = 0
                 winner_id = None
@@ -165,7 +158,7 @@ async def jackpot_loop():
 
                 winner_bet = game.jackpot_bets[winner_id]
                 game.jackpot_winner = winner_bet
-                game.jackpot_win_degree = random.randint(1080, 1440) # 3-4 полных оборота
+                game.jackpot_win_degree = random.randint(1080, 1440)
 
                 await broadcast({
                     "type": "jackpot_update", 
@@ -176,16 +169,15 @@ async def jackpot_loop():
                     "pot": total_pot
                 })
                 
-                await asyncio.sleep(6) # Ждем пока рулетка докрутится
+                await asyncio.sleep(6)
 
-                # Выплата
                 bal, inv, ld = get_or_create_user(winner_id)
                 new_bal = bal + total_pot
                 update_user_data(winner_id, balance=new_bal)
                 
                 if winner_id in game.connections:
                     await game.connections[winner_id].send_json({"type": "userData", "balance": new_bal, "inventory": inv})
-                    await game.connections[winner_id].send_json({"type": "notify", "msg": f"👑 ТЫ ПОБЕДИЛ В РУЛЕТКЕ!\nВыигрыш: +{total_pot} ⭐️!"})
+                    await game.connections[winner_id].send_json({"type": "notify", "msg": f"👑 ШАЙБА ВЫБРАЛА ТЕБЯ!\nЗабрал банк: +{total_pot} ⭐️!"})
 
                 game.jackpot_bets = {}
                 game.jackpot_state = "idle"
@@ -214,7 +206,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             data = await websocket.receive_json()
             action = data.get("action")
             
-            # СТАВКА КРАШ
             if action == "bet":
                 amount = data.get("amount", 0)
                 auto_cashout = data.get("auto_cashout", None)
@@ -249,7 +240,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
                         await broadcast({"type": "bets_update", "bets": game.active_bets})
 
-            # СТАВКА В PVP РУЛЕТКУ
             elif action == "jackpot_bet":
                 amount = data.get("amount", 0)
                 user_name = data.get("user_name", "Игрок")
@@ -273,7 +263,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                     await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": game.jackpot_timer})
 
-            # МИНЫ
             elif action == "mines_start":
                 bet = data.get("bet", 0)
                 mines_count = data.get("mines", 3)
@@ -317,12 +306,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "mines_state", "status": "cashed_out", "grid": m_game["grid"], "opened": m_game["opened"], "mult": mult, "win": win_amount})
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
 
-            # ЕЖЕДНЕВНЫЙ БОНУС
             elif action == "claim_daily":
                 bal, inv, last_daily = get_or_create_user(user_id)
                 now = int(time.time())
-                if now - last_daily >= 86400: # 24 часа
-                    new_bal = bal + 50000000 # 50 Млн бонус
+                if now - last_daily >= 86400:
+                    new_bal = bal + 50000000
                     update_user_data(user_id, balance=new_bal, last_daily=now)
                     await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                     await websocket.send_json({"type": "notify", "msg": "🎁 Ежедневный бонус +50 000 000 ⭐️ получен!"})
@@ -331,17 +319,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     hours = left // 3600
                     await websocket.send_json({"type": "notify", "msg": f"⏳ Бонус станет доступен через {hours} ч."})
 
-            # ПРОМОКОДЫ
             elif action == "use_promo":
                 code = data.get("code", "").strip().upper()
                 bal, inv, ld = get_or_create_user(user_id)
-                
-                promos = {
-                    "STARBET": 100000000,   # +100 Млн
-                    "DUROV": 500000000,     # +500 Млн
-                    "CASINO": 1000000000    # +1 Млрд
-                }
-                
+                promos = {"STARBET": 100000000, "DUROV": 500000000, "CASINO": 1000000000}
                 if code in promos:
                     bonus = promos[code]
                     new_bal = bal + bonus
@@ -349,9 +330,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                     await websocket.send_json({"type": "notify", "msg": f"🎉 Промокод активирован!\nНачислено +{bonus} ⭐️!"})
                 else:
-                    await websocket.send_json({"type": "notify", "msg": "❌ Неверный или истёкший промокод!"})
+                    await websocket.send_json({"type": "notify", "msg": "❌ Неверный промокод!"})
 
-            # ЧАТ
             elif action == "send_chat":
                 text = data.get("text", "").strip()
                 user_name = data.get("user_name", "Игрок")
@@ -376,7 +356,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 update_user_data(user_id, inventory=new_inv)
                 await websocket.send_json({"type": "userData", "balance": bal, "inventory": new_inv})
 
-            # ОБНОВИТЬ ТОП
             elif action == "get_leaderboard":
                 await websocket.send_json({"type": "leaderboard", "data": get_leaderboard()})
                     
