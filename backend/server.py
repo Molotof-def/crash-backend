@@ -35,7 +35,7 @@ def update_balance(user_id: int, amount: int):
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Разрешаем подключения откуда угодно
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,16 +44,15 @@ app.add_middleware(
 # Глобальное состояние игры
 class GameState:
     def __init__(self):
-        self.state = "idle" # idle, running, crashed
+        self.state = "idle"
         self.multiplier = 1.0
         self.target_crash = 1.0
-        self.active_bets = {} # user_id: bet_amount
-        self.connections = [] # список всех активных вебсокетов
+        self.active_bets = {}
+        self.connections = []
 
 game = GameState()
 
 async def broadcast(message: dict):
-    """Отправка сообщения всем подключенным игрокам"""
     for connection in game.connections:
         try:
             await connection.send_json(message)
@@ -61,7 +60,6 @@ async def broadcast(message: dict):
             pass
 
 async def game_loop():
-    """Основной цикл игры, который работает бесконечно на фоне"""
     while True:
         # 1. Ждем ставки (5 секунд)
         game.state = "idle"
@@ -95,12 +93,11 @@ async def game_loop():
             if game.state == "crashed":
                 break
             
-            await asyncio.sleep(0.1) # Обновляем 10 раз в секунду
+            await asyncio.sleep(0.1)
 
-        # 4. Пауза после краша (3 секунды)
+        # 4. Пауза после краша
         await asyncio.sleep(3)
 
-# Запускаем игровой цикл при старте сервера
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(game_loop())
@@ -110,7 +107,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.accept()
     game.connections.append(websocket)
     
-    # Отправляем юзеру его баланс при входе
     balance = get_or_create_user(user_id)
     await websocket.send_json({"type": "balance_update", "balance": balance})
     
@@ -132,9 +128,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     win_amount = int(game.active_bets[user_id] * game.multiplier)
                     update_balance(user_id, win_amount)
                     balance += win_amount
-                    del game.active_bets[user_id] # Удаляем ставку, чтобы не забрал дважды
+                    del game.active_bets[user_id]
                     await websocket.send_json({"type": "balance_update", "balance": balance})
                     await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
+            
+            # --- ВОТ ТОТ САМЫЙ КУСОК КОДА ДЛЯ ПОПОЛНЕНИЯ ---        
+            elif action == "topup":
+                update_balance(user_id, 10000)
+                balance += 10000
+                await websocket.send_json({"type": "balance_update", "balance": balance})
+                await websocket.send_json({"type": "notify", "msg": "🤑 Начислено +10 000 ⭐️!"})
                     
     except WebSocketDisconnect:
         game.connections.remove(websocket)
