@@ -7,13 +7,12 @@ import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-# Создаем базу данных с поддержкой инвентаря
 conn = sqlite3.connect("casino.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        balance INTEGER DEFAULT 5000,
+        balance INTEGER DEFAULT 10000000000,
         inventory TEXT DEFAULT '[]'
     )
 """)
@@ -24,9 +23,9 @@ def get_or_create_user(user_id: int):
     row = cursor.fetchone()
     if row:
         return row[0], json.loads(row[1])
-    cursor.execute("INSERT INTO users (user_id, balance, inventory) VALUES (?, ?, ?)", (user_id, 5000, '[]'))
+    cursor.execute("INSERT INTO users (user_id, balance, inventory) VALUES (?, ?, ?)", (user_id, 10000000000, '[]'))
     conn.commit()
-    return 5000, []
+    return 10000000000, []
 
 def update_user_data(user_id: int, balance: int = None, inventory: list = None):
     if balance is not None:
@@ -51,8 +50,18 @@ class GameState:
         self.target_crash = 1.0
         self.active_bets = {}
         self.connections = {} 
+        self.mines_games = {}
 
 game = GameState()
+
+def calculate_mines_mult(mines_count, opened_count):
+    if opened_count == 0:
+        return 1.0
+    mult = 1.0
+    total_cells = 25
+    for i in range(opened_count):
+        mult *= (total_cells - i) / (total_cells - mines_count - i)
+    return round(mult * 0.97, 2)
 
 async def broadcast(message: dict):
     for ws in list(game.connections.values()):
@@ -63,7 +72,6 @@ async def broadcast(message: dict):
 
 async def game_loop():
     while True:
-        # 1. Прием ставок
         game.state = "idle"
         game.multiplier = 1.0
         game.active_bets = {}
@@ -75,13 +83,11 @@ async def game_loop():
         })
         await asyncio.sleep(5)
 
-        # 2. Генерация точки краша
         rand = random.random()
         game.target_crash = 1.0
         if rand > 0.05:
             game.target_crash = round(1 + math.pow(random.random(), 3) * 30, 2)
 
-        # 3. Полет ракеты
         game.state = "running"
         start_time = time.time()
         
@@ -97,7 +103,6 @@ async def game_loop():
                         bet["status"] = "crashed"
             else:
                 game.multiplier = current_mult
-                # Автовывод
                 for uid, bet in list(game.active_bets.items()):
                     if bet["status"] == "playing" and bet["auto_cashout"] and current_mult >= bet["auto_cashout"]:
                         win_amount = int(bet["amount"] * bet["auto_cashout"])
@@ -135,7 +140,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.accept()
     game.connections[user_id] = websocket
     
-    # Загружаем баланс и инвентарь из базы
     balance, inventory = get_or_create_user(user_id)
     await websocket.send_json({"type": "userData", "balance": balance, "inventory": inventory})
     
@@ -181,16 +185,101 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                         await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
                         await broadcast({"type": "bets_update", "bets": game.active_bets})
+
+            # --- МИНЫ ---
+            elif action == "mines_start":
+                bet = data.get("bet", 0)
+                mines_count = data.get("mines", 3)
+                bal, inv = get_or_create_user(user_id)
+                
+                if bet > 0 and bal >= bet and 1 <= mines_count <= 24:
+                    new_bal = bal - bet
+                    update_user_data(user_id, balance=new_bal)
+                    
+                    grid = ["gem"] * 25
+                    mine_indices = random.sample(range(25), mines_count)
+                    for idx in mine_indices:
+                        grid[idx] = "mine"
                         
+                    game.mines_games[user_id] = {
+                        "bet": bet,
+                        "mines_count": mines_count,
+                        "grid": grid,
+                        "opened": [],
+                        "status": "playing"
+                    }
+                    
+                    await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
+                    await websocket.send_json({
+                        "type": "mines_state", 
+                        "status": "playing", 
+                        "opened": [], 
+                        "grid": [],
+                        "mult": 1.0, 
+                        "win": 0
+                    })
+
+            elif action == "mines_open":
+                cell_idx = data.get("cell")
+                m_game = game.mines_games.get(user_id)
+                
+                if m_game and m_game["status"] == "playing" and cell_idx not in m_game["opened"]:
+                    if m_game["grid"][cell_idx] == "mine":
+                        m_game["status"] = "crashed"
+                        await websocket.send_json({
+                            "type": "mines_state", 
+                            "status": "crashed", 
+                            "grid": m_game["grid"], 
+                            "opened": m_game["opened"] + [cell_idx],
+                            "mult": 0,
+                            "win": 0
+                        })
+                    else:
+                        m_game["opened"].append(cell_idx)
+                        mult = calculate_mines_mult(m_game["mines_count"], len(m_game["opened"]))
+                        win = int(m_game["bet"] * mult)
+                        
+                        await websocket.send_json({
+                            "type": "mines_state", 
+                            "status": "playing", 
+                            "opened": m_game["opened"], 
+                            "grid": [],
+                            "mult": mult, 
+                            "win": win
+                        })
+
+            elif action == "mines_cashout":
+                m_game = game.mines_games.get(user_id)
+                if m_game and m_game["status"] == "playing" and len(m_game["opened"]) > 0:
+                    mult = calculate_mines_mult(m_game["mines_count"], len(m_game["opened"]))
+                    win_amount = int(m_game["bet"] * mult)
+                    
+                    bal, inv = get_or_create_user(user_id)
+                    new_bal = bal + win_amount
+                    update_user_data(user_id, balance=new_bal)
+                    
+                    m_game["status"] = "cashed_out"
+                    
+                    await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
+                    await websocket.send_json({
+                        "type": "mines_state", 
+                        "status": "cashed_out", 
+                        "grid": m_game["grid"], 
+                        "opened": m_game["opened"],
+                        "mult": mult,
+                        "win": win_amount
+                    })
+                    await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
+
+            # --- ПОПОЛНЕНИЕ НА 1 МИЛЛИАРД ---
             elif action == "topup":
                 bal, inv = get_or_create_user(user_id)
-                new_bal = bal + 10000
+                new_bal = bal + 1000000000  # Добавляем 1 000 000 000
                 update_user_data(user_id, balance=new_bal)
                 await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
-                await websocket.send_json({"type": "notify", "msg": "🤑 Начислено +10 000 ⭐️!"})
+                await websocket.send_json({"type": "notify", "msg": "🤑 Начислено +1 000 000 000 ⭐️!"})
 
             elif action == "save_inventory":
-                # Сохраняем новые NFT в базу
                 new_inv = data.get("inventory", [])
                 bal, _ = get_or_create_user(user_id)
                 update_user_data(user_id, inventory=new_inv)
