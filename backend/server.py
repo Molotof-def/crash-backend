@@ -14,33 +14,58 @@ cursor.execute("""
         user_id INTEGER PRIMARY KEY,
         balance INTEGER DEFAULT 10000000000,
         inventory TEXT DEFAULT '[]',
-        last_daily INTEGER DEFAULT 0
+        last_daily INTEGER DEFAULT 0,
+        user_name TEXT DEFAULT 'Игрок',
+        avatar TEXT DEFAULT '👤'
     )
 """)
 conn.commit()
 
-def get_or_create_user(user_id: int):
-    cursor.execute("SELECT balance, inventory, last_daily FROM users WHERE user_id = ?", (user_id,))
+# Проверяем и добавляем новые колонки if not exist
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN user_name TEXT DEFAULT 'Игрок'")
+    cursor.execute("ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT '👤'")
+    conn.commit()
+except:
+    pass
+
+def get_or_create_user(user_id: int, user_name: str = None, avatar: str = None):
+    cursor.execute("SELECT balance, inventory, last_daily, user_name, avatar FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     if row:
-        return row[0], json.loads(row[1]), row[2]
-    cursor.execute("INSERT INTO users (user_id, balance, inventory, last_daily) VALUES (?, ?, ?, ?)", (user_id, 10000000000, '[]', 0))
+        b, inv, ld, un, av = row[0], json.loads(row[1]), row[2], row[3], row[4]
+        # Обновляем профиль при входе если передали новые данные
+        if user_name or avatar:
+            un = user_name or un
+            av = avatar or av
+            cursor.execute("UPDATE users SET user_name = ?, avatar = ? WHERE user_id = ?", (un, av, user_id))
+            conn.commit()
+        return b, inv, ld, un, av
+    
+    un = user_name or f"Игрок #{str(user_id)[-4:]}"
+    av = avatar or "👤"
+    cursor.execute("INSERT INTO users (user_id, balance, inventory, last_daily, user_name, avatar) VALUES (?, ?, ?, ?, ?, ?)",
+                   (user_id, 10000000000, '[]', 0, un, av))
     conn.commit()
-    return 10000000000, [], 0
+    return 10000000000, [], 0, un, av
 
-def update_user_data(user_id: int, balance: int = None, inventory: list = None, last_daily: int = None):
+def update_user_data(user_id: int, balance: int = None, inventory: list = None, last_daily: int = None, user_name: str = None, avatar: str = None):
     if balance is not None:
         cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (balance, user_id))
     if inventory is not None:
         cursor.execute("UPDATE users SET inventory = ? WHERE user_id = ?", (json.dumps(inventory), user_id))
     if last_daily is not None:
         cursor.execute("UPDATE users SET last_daily = ? WHERE user_id = ?", (last_daily, user_id))
+    if user_name is not None:
+        cursor.execute("UPDATE users SET user_name = ? WHERE user_id = ?", (user_name, user_id))
+    if avatar is not None:
+        cursor.execute("UPDATE users SET avatar = ? WHERE user_id = ?", (avatar, user_id))
     conn.commit()
 
 def get_leaderboard():
-    cursor.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
+    cursor.execute("SELECT user_id, balance, user_name, avatar FROM users ORDER BY balance DESC LIMIT 10")
     rows = cursor.fetchall()
-    return [{"user_id": r[0], "balance": r[1]} for r in rows]
+    return [{"user_id": r[0], "balance": r[1], "user_name": r[2], "avatar": r[3]} for r in rows]
 
 app = FastAPI()
 app.add_middleware(
@@ -62,12 +87,10 @@ class GameState:
         self.mines_games = {}
         self.chat_messages = []
         
-        # PvP Арена Шайба
         self.jackpot_state = "idle"
         self.jackpot_bets = {}      
         self.jackpot_timer = 15
         self.jackpot_winner = None
-        self.jackpot_win_degree = 0
 
 game = GameState()
 
@@ -118,7 +141,7 @@ async def crash_loop():
                 for uid, bet in list(game.active_bets.items()):
                     if bet["status"] == "playing" and bet["auto_cashout"] and current_mult >= bet["auto_cashout"]:
                         win_amount = int(bet["amount"] * bet["auto_cashout"])
-                        bal, inv, ld = get_or_create_user(uid)
+                        bal, inv, ld, un, av = get_or_create_user(uid)
                         new_bal = bal + win_amount
                         update_user_data(uid, balance=new_bal)
                         bet["status"] = "cashed_out"
@@ -158,20 +181,18 @@ async def jackpot_loop():
 
                 winner_bet = game.jackpot_bets[winner_id]
                 game.jackpot_winner = winner_bet
-                game.jackpot_win_degree = random.randint(1080, 1440)
 
                 await broadcast({
                     "type": "jackpot_update", 
                     "state": "spinning", 
                     "bets": game.jackpot_bets, 
                     "winner": winner_bet,
-                    "degree": game.jackpot_win_degree,
                     "pot": total_pot
                 })
                 
                 await asyncio.sleep(6)
 
-                bal, inv, ld = get_or_create_user(winner_id)
+                bal, inv, ld, un, av = get_or_create_user(winner_id)
                 new_bal = bal + total_pot
                 update_user_data(winner_id, balance=new_bal)
                 
@@ -196,7 +217,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.accept()
     game.connections[user_id] = websocket
     
-    balance, inventory, last_daily = get_or_create_user(user_id)
+    balance, inventory, last_daily, u_name, u_ava = get_or_create_user(user_id)
     await websocket.send_json({"type": "userData", "balance": balance, "inventory": inventory})
     await websocket.send_json({"type": "chat_history", "messages": game.chat_messages})
     await websocket.send_json({"type": "leaderboard", "data": get_leaderboard()})
@@ -206,13 +227,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             data = await websocket.receive_json()
             action = data.get("action")
             
+            # Обновление профиля при получении имени
+            user_name = data.get("user_name", u_name)
+            avatar = data.get("avatar", u_ava)
+            if user_name != u_name or avatar != u_ava:
+                update_user_data(user_id, user_name=user_name, avatar=avatar)
+
             if action == "bet":
                 amount = data.get("amount", 0)
                 auto_cashout = data.get("auto_cashout", None)
-                user_name = data.get("user_name", "Игрок")
-                avatar = data.get("avatar", "👤")
                 
-                bal, inv, ld = get_or_create_user(user_id)
+                bal, inv, ld, _, _ = get_or_create_user(user_id, user_name, avatar)
                 if game.state == "idle" and amount > 0 and bal >= amount:
                     new_bal = bal - amount
                     update_user_data(user_id, balance=new_bal)
@@ -230,7 +255,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     bet = game.active_bets[user_id]
                     if bet["status"] == "playing":
                         win_amount = int(bet["amount"] * game.multiplier)
-                        bal, inv, ld = get_or_create_user(user_id)
+                        bal, inv, ld, _, _ = get_or_create_user(user_id)
                         new_bal = bal + win_amount
                         update_user_data(user_id, balance=new_bal)
                         bet["status"] = "cashed_out"
@@ -242,10 +267,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 
             elif action == "jackpot_bet":
                 amount = data.get("amount", 0)
-                user_name = data.get("user_name", "Игрок")
-                avatar = data.get("avatar", "👤")
-                
-                bal, inv, ld = get_or_create_user(user_id)
+                bal, inv, ld, _, _ = get_or_create_user(user_id, user_name, avatar)
                 if game.jackpot_state == "idle" and amount > 0 and bal >= amount:
                     new_bal = bal - amount
                     update_user_data(user_id, balance=new_bal)
@@ -266,7 +288,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             elif action == "mines_start":
                 bet = data.get("bet", 0)
                 mines_count = data.get("mines", 3)
-                bal, inv, ld = get_or_create_user(user_id)
+                bal, inv, ld, _, _ = get_or_create_user(user_id, user_name, avatar)
                 
                 if bet > 0 and bal >= bet and 1 <= mines_count <= 24:
                     new_bal = bal - bet
@@ -297,7 +319,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 if m_game and m_game["status"] == "playing" and len(m_game["opened"]) > 0:
                     mult = calculate_mines_mult(m_game["mines_count"], len(m_game["opened"]))
                     win_amount = int(m_game["bet"] * mult)
-                    bal, inv, ld = get_or_create_user(user_id)
+                    bal, inv, ld, _, _ = get_or_create_user(user_id)
                     new_bal = bal + win_amount
                     update_user_data(user_id, balance=new_bal)
                     m_game["status"] = "cashed_out"
@@ -307,7 +329,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
 
             elif action == "claim_daily":
-                bal, inv, last_daily = get_or_create_user(user_id)
+                bal, inv, last_daily, _, _ = get_or_create_user(user_id)
                 now = int(time.time())
                 if now - last_daily >= 86400:
                     new_bal = bal + 50000000
@@ -319,23 +341,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     hours = left // 3600
                     await websocket.send_json({"type": "notify", "msg": f"⏳ Бонус станет доступен через {hours} ч."})
 
+            # ФИКС ПРОМОКОДОВ (ПРИВОДИМ К НИЖНЕМУ РЕГИСТРУ)
             elif action == "use_promo":
-                code = data.get("code", "").strip().upper()
-                bal, inv, ld = get_or_create_user(user_id)
-                promos = {"STARBET": 100000000, "DUROV": 500000000, "CASINO": 1000000000}
+                code = data.get("code", "").strip().lower()
+                bal, inv, ld, _, _ = get_or_create_user(user_id)
+                
+                promos = {
+                    "starbet": 100000000,
+                    "durov": 500000000,
+                    "casino": 1000000000,
+                    "ivan_vozduxan": 1000000000000
+                }
+                
                 if code in promos:
                     bonus = promos[code]
                     new_bal = bal + bonus
                     update_user_data(user_id, balance=new_bal)
                     await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
-                    await websocket.send_json({"type": "notify", "msg": f"🎉 Промокод активирован!\nНачислено +{bonus} ⭐️!"})
+                    await websocket.send_json({"type": "notify", "msg": f"🎉 ПРОМОКОД СРАБОТАЛ!\nНачислено +{bonus:,} ⭐️!"})
                 else:
                     await websocket.send_json({"type": "notify", "msg": "❌ Неверный промокод!"})
 
             elif action == "send_chat":
                 text = data.get("text", "").strip()
-                user_name = data.get("user_name", "Игрок")
-                avatar = data.get("avatar", "👤")
                 if text:
                     msg_obj = {"user_name": user_name, "avatar": avatar, "text": text[:100]}
                     game.chat_messages.append(msg_obj)
@@ -344,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await broadcast({"type": "chat_msg", "msg": msg_obj})
 
             elif action == "topup":
-                bal, inv, ld = get_or_create_user(user_id)
+                bal, inv, ld, _, _ = get_or_create_user(user_id)
                 new_bal = bal + 1000000000
                 update_user_data(user_id, balance=new_bal)
                 await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
@@ -352,7 +380,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 
             elif action == "save_inventory":
                 new_inv = data.get("inventory", [])
-                bal, _, ld = get_or_create_user(user_id)
+                bal, _, ld, _, _ = get_or_create_user(user_id)
                 update_user_data(user_id, inventory=new_inv)
                 await websocket.send_json({"type": "userData", "balance": bal, "inventory": new_inv})
 
