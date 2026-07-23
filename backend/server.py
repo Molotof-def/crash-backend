@@ -43,9 +43,8 @@ class GameState:
         self.state = "idle"
         self.multiplier = 1.0
         self.target_crash = 1.0
-        # active_bets: { user_id: {"amount": 100, "auto_cashout": 2.0, "status": "playing", "win": 0} }
         self.active_bets = {}
-        self.connections = {} # { user_id: websocket }
+        self.connections = {} 
 
 game = GameState()
 
@@ -58,7 +57,7 @@ async def broadcast(message: dict):
 
 async def game_loop():
     while True:
-        # 1. Ожидание ставок (5 сек)
+        # 1. Ожидание ставок
         game.state = "idle"
         game.multiplier = 1.0
         game.active_bets = {}
@@ -70,7 +69,7 @@ async def game_loop():
         })
         await asyncio.sleep(5)
 
-        # 2. Генерация точки краша
+        # 2. Генерация краша
         rand = random.random()
         game.target_crash = 1.0
         if rand > 0.05:
@@ -87,13 +86,12 @@ async def game_loop():
             if current_mult >= game.target_crash:
                 game.multiplier = game.target_crash
                 game.state = "crashed"
-                # Все, кто не успел забрать — сгорели
                 for uid, bet in game.active_bets.items():
                     if bet["status"] == "playing":
                         bet["status"] = "crashed"
             else:
                 game.multiplier = current_mult
-                # ПРОВЕРКА АВТОВЫВОДА ДЛЯ ВСЕХ ИГРОКОВ
+                # Автовывод
                 for uid, bet in list(game.active_bets.items()):
                     if bet["status"] == "playing" and bet["auto_cashout"] and current_mult >= bet["auto_cashout"]:
                         win_amount = int(bet["amount"] * bet["auto_cashout"])
@@ -101,11 +99,10 @@ async def game_loop():
                         bet["status"] = "cashed_out"
                         bet["win"] = win_amount
                         
-                        # Уведомляем конкретного юзера о срабатывании автовывода
                         if uid in game.connections:
                             bal = get_or_create_user(uid)
                             await game.connections[uid].send_json({"type": "balance_update", "balance": bal})
-                            await game.connections[uid].send_json({"type": "notify", "msg": f"🎯 Автовывод сработал на {bet['auto_cashout']}x! (+{win_amount} ⭐️)"})
+                            await game.connections[uid].send_json({"type": "notify", "msg": f"🎯 Автовывод на {bet['auto_cashout']}x! (+{win_amount} ⭐️)"})
 
             await broadcast({
                 "type": "state_update", 
@@ -119,7 +116,6 @@ async def game_loop():
             
             await asyncio.sleep(0.1)
 
-        # 4. Пауза после краша
         await asyncio.sleep(3)
 
 @app.on_event("startup")
@@ -141,7 +137,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             
             if action == "bet":
                 amount = data.get("amount", 0)
-                auto_cashout = data.get("auto_cashout", None) # Число или None
+                auto_cashout = data.get("auto_cashout", None)
+                # Получаем ник и аву от клиента
+                user_name = data.get("user_name", f"Игрок #{str(user_id)[-4:]}")
+                avatar = data.get("avatar", "👤")
                 
                 if game.state == "idle" and amount > 0 and balance >= amount:
                     update_balance(user_id, -amount)
@@ -150,7 +149,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         "amount": amount,
                         "auto_cashout": auto_cashout,
                         "status": "playing",
-                        "win": 0
+                        "win": 0,
+                        "user_name": user_name,
+                        "avatar": avatar
                     }
                     await websocket.send_json({"type": "balance_update", "balance": balance})
                     await broadcast({"type": "bets_update", "bets": game.active_bets})
