@@ -338,26 +338,35 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
                         await broadcast({"type": "bets_update", "bets": game.active_bets})
 
-            elif action == "jackpot_bet":
-                amount = data.get("amount", 0)
-                b, inv, ld, _, _, tg, mw, tp, ct, fc = get_or_create_user(user_id, user_name, avatar)
-                if game.jackpot_state == "idle" and amount > 0 and b >= amount:
-                    new_bal = b - amount
-                    update_user_data(user_id, balance=new_bal)
+            # --- 📦 ОТКРЫТИЕ КЕЙСОВ ---
+            elif action == "open_case":
+                case_type = data.get("case_type")
+                costs = {"bronze": 10000000, "doom": 500000000, "vozduxan": 10000000000}
+                cost = costs.get(case_type, 10000000)
+                
+                b, inv, ld, _, _, tg, mw, tp, ct, fc = get_or_create_user(user_id)
+                if b >= cost:
+                    new_bal = b - cost
                     
-                    if user_id in game.jackpot_bets:
-                        game.jackpot_bets[user_id]["amount"] += amount
-                    else:
-                        game.jackpot_bets[user_id] = {
-                            "user_id": user_id,
-                            "amount": amount,
-                            "user_name": user_name,
-                            "avatar": avatar
-                        }
-                    
-                    await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv, "stats": {"total_games": tg, "max_win": mw, "total_profit": tp}, "custom_title": ct, "frame_color": fc})
-                    await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": game.jackpot_timer})
+                    # Генерируем выигрыш
+                    if case_type == "bronze":
+                        win_prize = random.choice([5000000, 15000000, 50000000, 100000000])
+                    elif case_type == "doom":
+                        win_prize = random.choice([100000000, 750000000, 2000000000, 5000000000])
+                    else: # vozduxan
+                        win_prize = random.choice([2000000000, 15000000000, 50000000000, 500000000000])
 
+                    final_bal = new_bal + win_prize
+                    update_user_data(user_id, balance=final_bal, games_add=1, win_amount=win_prize, profit_add=win_prize - cost)
+
+                    await websocket.send_json({
+                        "type": "case_opened",
+                        "prize": win_prize,
+                        "cost": cost,
+                        "balance": final_bal
+                    })
+
+            # --- ⚔️ DUAL COINFLIP ---
             elif action == "create_coinflip":
                 amount = data.get("amount", 0)
                 side = data.get("side", "eagle")
