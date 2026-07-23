@@ -3,11 +3,9 @@ import random
 import sqlite3
 import math
 import time
-import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-# Настройка базы данных SQLite
 conn = sqlite3.connect("casino.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -31,7 +29,6 @@ def update_balance(user_id: int, amount: int):
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
 
-# Настройка FastAPI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -41,31 +38,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Глобальное состояние игры
 class GameState:
     def __init__(self):
         self.state = "idle"
         self.multiplier = 1.0
         self.target_crash = 1.0
+        # active_bets: { user_id: {"amount": 100, "auto_cashout": 2.0, "status": "playing", "win": 0} }
         self.active_bets = {}
-        self.connections = []
+        self.connections = {} # { user_id: websocket }
 
 game = GameState()
 
 async def broadcast(message: dict):
-    for connection in game.connections:
+    for ws in list(game.connections.values()):
         try:
-            await connection.send_json(message)
+            await ws.send_json(message)
         except:
             pass
 
 async def game_loop():
     while True:
-        # 1. Ждем ставки (5 секунд)
+        # 1. Ожидание ставок (5 сек)
         game.state = "idle"
         game.multiplier = 1.0
         game.active_bets = {}
-        await broadcast({"type": "state_update", "state": game.state, "multiplier": game.multiplier})
+        await broadcast({
+            "type": "state_update", 
+            "state": game.state, 
+            "multiplier": game.multiplier,
+            "bets": game.active_bets
+        })
         await asyncio.sleep(5)
 
         # 2. Генерация точки краша
@@ -85,10 +87,32 @@ async def game_loop():
             if current_mult >= game.target_crash:
                 game.multiplier = game.target_crash
                 game.state = "crashed"
+                # Все, кто не успел забрать — сгорели
+                for uid, bet in game.active_bets.items():
+                    if bet["status"] == "playing":
+                        bet["status"] = "crashed"
             else:
                 game.multiplier = current_mult
-                
-            await broadcast({"type": "state_update", "state": game.state, "multiplier": game.multiplier})
+                # ПРОВЕРКА АВТОВЫВОДА ДЛЯ ВСЕХ ИГРОКОВ
+                for uid, bet in list(game.active_bets.items()):
+                    if bet["status"] == "playing" and bet["auto_cashout"] and current_mult >= bet["auto_cashout"]:
+                        win_amount = int(bet["amount"] * bet["auto_cashout"])
+                        update_balance(uid, win_amount)
+                        bet["status"] = "cashed_out"
+                        bet["win"] = win_amount
+                        
+                        # Уведомляем конкретного юзера о срабатывании автовывода
+                        if uid in game.connections:
+                            bal = get_or_create_user(uid)
+                            await game.connections[uid].send_json({"type": "balance_update", "balance": bal})
+                            await game.connections[uid].send_json({"type": "notify", "msg": f"🎯 Автовывод сработал на {bet['auto_cashout']}x! (+{win_amount} ⭐️)"})
+
+            await broadcast({
+                "type": "state_update", 
+                "state": game.state, 
+                "multiplier": game.multiplier,
+                "bets": game.active_bets
+            })
             
             if game.state == "crashed":
                 break
@@ -105,7 +129,7 @@ async def startup_event():
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.accept()
-    game.connections.append(websocket)
+    game.connections[user_id] = websocket
     
     balance = get_or_create_user(user_id)
     await websocket.send_json({"type": "balance_update", "balance": balance})
@@ -117,22 +141,34 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             
             if action == "bet":
                 amount = data.get("amount", 0)
+                auto_cashout = data.get("auto_cashout", None) # Число или None
+                
                 if game.state == "idle" and amount > 0 and balance >= amount:
                     update_balance(user_id, -amount)
                     balance -= amount
-                    game.active_bets[user_id] = amount
+                    game.active_bets[user_id] = {
+                        "amount": amount,
+                        "auto_cashout": auto_cashout,
+                        "status": "playing",
+                        "win": 0
+                    }
                     await websocket.send_json({"type": "balance_update", "balance": balance})
+                    await broadcast({"type": "bets_update", "bets": game.active_bets})
                     
             elif action == "cashout":
                 if game.state == "running" and user_id in game.active_bets:
-                    win_amount = int(game.active_bets[user_id] * game.multiplier)
-                    update_balance(user_id, win_amount)
-                    balance += win_amount
-                    del game.active_bets[user_id]
-                    await websocket.send_json({"type": "balance_update", "balance": balance})
-                    await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
-            
-            # --- ВОТ ТОТ САМЫЙ КУСОК КОДА ДЛЯ ПОПОЛНЕНИЯ ---        
+                    bet = game.active_bets[user_id]
+                    if bet["status"] == "playing":
+                        win_amount = int(bet["amount"] * game.multiplier)
+                        update_balance(user_id, win_amount)
+                        balance += win_amount
+                        bet["status"] = "cashed_out"
+                        bet["win"] = win_amount
+                        
+                        await websocket.send_json({"type": "balance_update", "balance": balance})
+                        await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
+                        await broadcast({"type": "bets_update", "bets": game.active_bets})
+                        
             elif action == "topup":
                 update_balance(user_id, 10000)
                 balance += 10000
@@ -140,4 +176,5 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 await websocket.send_json({"type": "notify", "msg": "🤑 Начислено +10 000 ⭐️!"})
                     
     except WebSocketDisconnect:
-        game.connections.remove(websocket)
+        if user_id in game.connections:
+            del game.connections[user_id]
