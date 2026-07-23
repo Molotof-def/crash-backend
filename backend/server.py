@@ -51,6 +51,7 @@ class GameState:
         self.active_bets = {}
         self.connections = {} 
         self.mines_games = {}
+        self.chat_messages = [] # История последних 20 сообщений чата
 
 game = GameState()
 
@@ -81,7 +82,7 @@ async def game_loop():
             "multiplier": game.multiplier,
             "bets": game.active_bets
         })
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
 
         rand = random.random()
         game.target_crash = 1.0
@@ -127,9 +128,10 @@ async def game_loop():
             if game.state == "crashed":
                 break
             
-            await asyncio.sleep(0.1)
+            # ОПТИМИЗАЦИЯ: Отправляем кадры чуть реже (150мс вместо 100мс), чтобы не сажать ОЗУ
+            await asyncio.sleep(0.15)
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2.5)
 
 @app.on_event("startup")
 async def startup_event():
@@ -142,6 +144,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     
     balance, inventory = get_or_create_user(user_id)
     await websocket.send_json({"type": "userData", "balance": balance, "inventory": inventory})
+    await websocket.send_json({"type": "chat_history", "messages": game.chat_messages})
     
     try:
         while True:
@@ -186,7 +189,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         await websocket.send_json({"type": "notify", "msg": f"Успешно забрал {win_amount} ⭐️"})
                         await broadcast({"type": "bets_update", "bets": game.active_bets})
 
-            # --- МИНЫ ---
+            # МИНЫ
             elif action == "mines_start":
                 bet = data.get("bet", 0)
                 mines_count = data.get("mines", 3)
@@ -271,10 +274,22 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     })
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
 
-            # --- ПОПОЛНЕНИЕ НА 1 МИЛЛИАРД ---
+            # ЖИВОЙ ЧАТ
+            elif action == "send_chat":
+                text = data.get("text", "").strip()
+                user_name = data.get("user_name", "Игрок")
+                avatar = data.get("avatar", "👤")
+                if text:
+                    msg_obj = {"user_name": user_name, "avatar": avatar, "text": text[:100]}
+                    game.chat_messages.append(msg_obj)
+                    if len(game.chat_messages) > 20:
+                        game.chat_messages.pop(0)
+                    await broadcast({"type": "chat_msg", "msg": msg_obj})
+
+            # ПОПОЛНИТЬ (+1 МЛРД)
             elif action == "topup":
                 bal, inv = get_or_create_user(user_id)
-                new_bal = bal + 1000000000  # Добавляем 1 000 000 000
+                new_bal = bal + 1000000000
                 update_user_data(user_id, balance=new_bal)
                 await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv})
                 await websocket.send_json({"type": "notify", "msg": "🤑 Начислено +1 000 000 000 ⭐️!"})
