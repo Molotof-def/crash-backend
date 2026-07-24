@@ -20,8 +20,8 @@ cursor.execute("""
         user_name TEXT DEFAULT 'Игрок',
         avatar TEXT DEFAULT '👤',
         total_games INTEGER DEFAULT 0,
-        max_win INTEGER DEFAULT 0,
-        total_profit INTEGER DEFAULT 0,
+        max_win REAL DEFAULT 0,
+        total_profit REAL DEFAULT 0,
         custom_title TEXT DEFAULT '',
         frame_color TEXT DEFAULT '',
         total_mines_x REAL DEFAULT 0.0,
@@ -40,8 +40,8 @@ conn.commit()
 
 for col in [
     "user_name TEXT DEFAULT 'Игрок'", "avatar TEXT DEFAULT '👤'", 
-    "total_games INTEGER DEFAULT 0", "max_win INTEGER DEFAULT 0", 
-    "total_profit INTEGER DEFAULT 0", "custom_title TEXT DEFAULT ''", 
+    "total_games INTEGER DEFAULT 0", "max_win REAL DEFAULT 0", 
+    "total_profit REAL DEFAULT 0", "custom_title TEXT DEFAULT ''", 
     "frame_color TEXT DEFAULT ''", "total_mines_x REAL DEFAULT 0.0",
     "game_history TEXT DEFAULT '[]'", "balance_ton REAL DEFAULT 100.0"
 ]:
@@ -104,8 +104,8 @@ def update_user_data(user_id: int, balance: int = None, balance_ton: float = Non
     new_bal = balance if balance is not None else cur_bal
     new_bton = balance_ton if balance_ton is not None else cur_bton
     new_tg = cur_tg + games_add
-    new_mw = max(cur_mw, int(win_amount))
-    new_tp = cur_tp + int(profit_add)
+    new_mw = max(cur_mw, win_amount)
+    new_tp = cur_tp + profit_add
     new_ct = custom_title if custom_title is not None else cur_ct
     new_fc = frame_color if frame_color is not None else cur_fc
     new_tmx = cur_tmx + add_mines_x
@@ -256,9 +256,81 @@ async def crash_loop():
 
         await asyncio.sleep(2.5)
 
+async def jackpot_loop():
+    while True:
+        if game.jackpot_state == "idle":
+            if len(game.jackpot_bets) >= 2:
+                for t in range(15, -1, -1):
+                    game.jackpot_timer = t
+                    await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": t})
+                    await asyncio.sleep(1)
+                
+                game.jackpot_state = "spinning"
+                total_pot = sum(b["amount"] for b in game.jackpot_bets.values())
+                
+                pick = random.uniform(0.001, total_pot)
+                current = 0
+                winner_id = None
+                
+                for uid, bet in game.jackpot_bets.items():
+                    current += bet["amount"]
+                    if pick <= current:
+                        winner_id = uid
+                        break
+
+                if not winner_id and len(game.jackpot_bets) > 0:
+                    winner_id = list(game.jackpot_bets.keys())[0]
+
+                winner_bet = game.jackpot_bets[winner_id]
+                game.jackpot_winner = winner_bet
+
+                await broadcast({
+                    "type": "jackpot_update", 
+                    "state": "spinning", 
+                    "bets": game.jackpot_bets, 
+                    "winner": winner_bet,
+                    "pot": round(total_pot, 2)
+                })
+                
+                await asyncio.sleep(6)
+
+                b, b_ton, inv, ld, un, av, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(winner_id)
+                curr = winner_bet.get("currency", "stars")
+                
+                if curr == "ton":
+                    new_bton = round(b_ton + total_pot, 2)
+                    update_user_data(winner_id, balance_ton=new_bton, games_add=1, win_amount=total_pot, profit_add=total_pot - winner_bet["amount"])
+                else:
+                    new_bal = int(b + total_pot)
+                    update_user_data(winner_id, balance=new_bal, games_add=1, win_amount=total_pot, profit_add=total_pot - winner_bet["amount"])
+
+                sym = "💎" if curr=="ton" else "⭐️"
+                add_user_game_history(winner_id, "🥏 Карта Зон", winner_bet["amount"], total_pot, round(total_pot / winner_bet["amount"], 2), sym)
+
+                for uid, bet in game.jackpot_bets.items():
+                    if uid != winner_id:
+                        add_user_game_history(uid, "🥏 Карта Зон", bet["amount"], 0, 0.0, sym)
+
+                if winner_id in game.connections:
+                    b_cur, b_ton_cur, _, _, _, tg_c, mw_c, tp_c, ct_c, fc_c, tmx_c, gh_c = get_or_create_user(winner_id)
+                    await game.connections[winner_id].send_json({
+                        "type": "userData", "balance": b_cur, "balance_ton": b_ton_cur, "inventory": inv,
+                        "stats": {"total_games": tg_c, "max_win": mw_c, "total_profit": tp_c, "total_mines_x": tmx_c},
+                        "game_history": gh_c, "custom_title": ct_c, "frame_color": fc_c
+                    })
+                    await game.connections[winner_id].send_json({"type": "notify", "msg": f"👑 ШАЙБА ВЫБРАЛА ТЕБЯ!\nЗабрал банк: +{round(total_pot, 2)} {sym}!"})
+
+                game.jackpot_bets = {}
+                game.jackpot_state = "idle"
+                game.jackpot_timer = 15
+            else:
+                await broadcast({"type": "jackpot_update", "state": "waiting", "bets": game.jackpot_bets, "timer": 15})
+                await asyncio.sleep(1)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(crash_loop())
+    asyncio.create_task(jackpot_loop())
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: int):
@@ -290,8 +362,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 auto_cashout = data.get("auto_cashout", None)
                 
                 b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id, user_name, avatar)
-                
                 can_bet = (b_ton >= amount) if currency == "ton" else (b >= amount)
+                
                 if game.state == "idle" and amount > 0 and can_bet:
                     if currency == "ton":
                         update_user_data(user_id, balance_ton=round(b_ton - amount, 2))
@@ -420,7 +492,122 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     sym = "💎" if curr=="ton" else "⭐️"
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} {sym} ({mult}x)!"})
 
-            # --- ➕ ПОПОЛНЕНИЯ (СПЕЦИАЛЬНО ДЛЯ ТОН И ЗВЕЗД) ---
+            # --- ⚔️ PVP COINFLIP ---
+            elif action == "create_coinflip":
+                amount = float(data.get("amount", 0))
+                currency = data.get("currency", "stars")
+                side = data.get("side", "eagle")
+                b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id, user_name, avatar)
+                
+                can_bet = (b_ton >= amount) if currency == "ton" else (b >= amount)
+                if amount > 0 and can_bet:
+                    if currency == "ton":
+                        update_user_data(user_id, balance_ton=round(b_ton - amount, 2))
+                    else:
+                        update_user_data(user_id, balance=int(b - amount))
+                        
+                    room_id = f"room_{user_id}_{int(time.time())}"
+                    game.coinflip_rooms[room_id] = {
+                        "room_id": room_id,
+                        "creator_id": user_id,
+                        "creator_name": user_name,
+                        "creator_avatar": avatar,
+                        "amount": amount,
+                        "currency": currency,
+                        "side": side
+                    }
+                    
+                    b_c, b_ton_c, _, _, _, tg_c, mw_c, tp_c, ct_c, fc_c, tmx_c, gh_c = get_or_create_user(user_id)
+                    await websocket.send_json({"type": "userData", "balance": b_c, "balance_ton": b_ton_c, "inventory": inv, "stats": {"total_games": tg_c, "max_win": mw_c, "total_profit": tp_c, "total_mines_x": tmx_c}, "game_history": gh_c, "custom_title": ct_c, "frame_color": fc_c})
+                    await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
+
+            elif action == "join_coinflip":
+                room_id = data.get("room_id")
+                room = game.coinflip_rooms.get(room_id)
+                b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id, user_name, avatar)
+                
+                if room and user_id != room["creator_id"]:
+                    curr = room.get("currency", "stars")
+                    can_bet = (b_ton >= room["amount"]) if curr == "ton" else (b >= room["amount"])
+                    
+                    if can_bet:
+                        if curr == "ton":
+                            update_user_data(user_id, balance_ton=round(b_ton - room["amount"], 2))
+                        else:
+                            update_user_data(user_id, balance=int(b - room["amount"]))
+                            
+                        winning_side = random.choice(["eagle", "tails"])
+                        total_pot = round(room["amount"] * 2, 2)
+                        
+                        winner_id = room["creator_id"] if winning_side == room["side"] else user_id
+                        loser_id = user_id if winner_id == room["creator_id"] else room["creator_id"]
+                        
+                        wb, wb_ton, winv, wld, wun, wav, wtg, wmw, wtp, wct, wfc, wtmx, wgh = get_or_create_user(winner_id)
+                        if curr == "ton":
+                            update_user_data(winner_id, balance_ton=round(wb_ton + total_pot, 2), games_add=1, win_amount=total_pot, profit_add=room["amount"])
+                        else:
+                            update_user_data(winner_id, balance=int(wb + total_pot), games_add=1, win_amount=total_pot, profit_add=room["amount"])
+
+                        update_user_data(loser_id, games_add=1, profit_add=-room["amount"])
+                        sym = "💎" if curr=="ton" else "⭐️"
+
+                        add_user_game_history(winner_id, "⚔️ Монетка", room["amount"], total_pot, 2.0, sym)
+                        add_user_game_history(loser_id, "⚔️ Монетка", room["amount"], 0, 0.0, sym)
+
+                        del game.coinflip_rooms[room_id]
+
+                        await broadcast({
+                            "type": "coinflip_result",
+                            "room_id": room_id,
+                            "winning_side": winning_side,
+                            "winner_id": winner_id,
+                            "winner_name": wun if winner_id == room["creator_id"] else user_name,
+                            "pot": total_pot,
+                            "symbol": sym
+                        })
+                        await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
+
+            # --- 🥏 PVP КАРТА ЗОН ---
+            elif action == "jackpot_bet":
+                amount = float(data.get("amount", 0))
+                currency = data.get("currency", "stars")
+                b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id, user_name, avatar)
+                can_bet = (b_ton >= amount) if currency == "ton" else (b >= amount)
+                
+                if game.jackpot_state == "idle" and amount > 0 and can_bet:
+                    if currency == "ton":
+                        update_user_data(user_id, balance_ton=round(b_ton - amount, 2))
+                    else:
+                        update_user_data(user_id, balance=int(b - amount))
+                    
+                    if user_id in game.jackpot_bets:
+                        game.jackpot_bets[user_id]["amount"] += amount
+                    else:
+                        game.jackpot_bets[user_id] = {
+                            "user_id": user_id,
+                            "amount": amount,
+                            "currency": currency,
+                            "user_name": user_name,
+                            "avatar": avatar
+                        }
+                    
+                    b_c, b_ton_c, _, _, _, tg_c, mw_c, tp_c, ct_c, fc_c, tmx_c, gh_c = get_or_create_user(user_id)
+                    await websocket.send_json({"type": "userData", "balance": b_c, "balance_ton": b_ton_c, "inventory": inv, "stats": {"total_games": tg_c, "max_win": mw_c, "total_profit": tp_c, "total_mines_x": tmx_c}, "game_history": gh_c, "custom_title": ct_c, "frame_color": fc_c})
+                    await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": game.jackpot_timer})
+
+            elif action == "use_promo":
+                code = data.get("code", "").strip().lower()
+                b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id)
+                promos = {"starbet": 100000000, "durov": 500000000, "casino": 1000000000, "ivan_vozduxan": 1000000000000}
+                if code in promos:
+                    bonus = promos[code]
+                    new_bal = b + bonus
+                    update_user_data(user_id, balance=new_bal)
+                    await websocket.send_json({"type": "userData", "balance": new_bal, "balance_ton": b_ton, "inventory": inv, "stats": {"total_games": tg, "max_win": mw, "total_profit": tp, "total_mines_x": tmx}, "game_history": gh, "custom_title": ct, "frame_color": fc})
+                    await websocket.send_json({"type": "notify", "msg": f"🎉 ПРОМОКОД СРАБОТАЛ!\nНачислено +{bonus:,} ⭐️!"})
+                else:
+                    await websocket.send_json({"type": "notify", "msg": "❌ Неверный промокод!"})
+
             elif action == "topup_ton":
                 b, b_ton, inv, ld, _, _, tg, mw, tp, ct, fc, tmx, gh = get_or_create_user(user_id)
                 new_bton = round(b_ton + 10.0, 2)
