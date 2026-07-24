@@ -3,8 +3,12 @@ import random
 import math
 import time
 import json
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+BOT_TOKEN = "ВАШ_ТОКЕН_БОТА" # Тот же токен, что и в bot.py
+ADMIN_ID = "5103088337"
 
 app = FastAPI()
 app.add_middleware(
@@ -15,15 +19,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ADMIN_ID = "5103088337"
-
 users_db = {}
 crash_history_ram = [1.25, 3.40, 1.10, 5.50, 2.10, 1.05]
 
 def get_or_create_user(user_id, user_name="Игрок", avatar="👤"):
     uid = str(user_id)
     if uid not in users_db:
-        init_bal = 1000000000 if uid == ADMIN_ID else 10000
+        init_bal = 1000000000 if uid == ADMIN_ID else 100
         users_db[uid] = {
             "user_id": uid,
             "balance": init_bal,
@@ -47,6 +49,24 @@ def add_user_history(uid, mode, bet, win, mult):
     u["stats"]["total_profit"] += (win - bet)
     if win > u["stats"]["max_win"]: u["stats"]["max_win"] = win
 
+# Генерация официальной ссылки оплаты Telegram Stars (XTR)
+async def create_star_invoice_link(stars_amount: int, user_id: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink"
+    payload = {
+        "title": "Пополнение баланса",
+        "description": f"Пополнение {stars_amount} ⭐️ в DOOM GIFT",
+        "payload": json.dumps({"user_id": user_id, "stars": stars_amount}),
+        "provider_token": "", # Пусто для Telegram Stars!
+        "currency": "XTR",   # Валюта Telegram Stars
+        "prices": [{"label": "Stars", "amount": stars_amount}]
+    }
+    async with httpx.AsyncClient() as client:
+        res = await client.post(url, json=payload)
+        data = res.json()
+        if data.get("ok"):
+            return data.get("result")
+    return None
+
 class GameState:
     def __init__(self):
         self.state = "idle"
@@ -57,6 +77,9 @@ class GameState:
         self.connections = {} 
         self.mines_games = {}
         self.coinflip_rooms = {}
+        self.jackpot_state = "idle"
+        self.jackpot_bets = {}
+        self.jackpot_timer = 15
 
 game = GameState()
 
@@ -149,6 +172,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         "history": crash_history_ram,
         "bets": game.active_bets
     })
+    await websocket.send_json({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
 
     try:
         while True:
@@ -157,16 +181,20 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             action = data.get("action")
             u = get_or_create_user(uid, data.get("user_name"), data.get("avatar"))
 
-            # 👑 АДМИНКА
-            if action == "admin_add_stars" and uid == ADMIN_ID:
+            # 💳 ЗАПРОС ОПЛАТЫ TELEGRAM STARS
+            if action == "buy_stars_invoice":
+                amount = int(data.get("stars", 50))
+                invoice_link = await create_star_invoice_link(amount, uid)
+                if invoice_link:
+                    await websocket.send_json({"type": "open_invoice", "url": invoice_link, "stars": amount})
+                else:
+                    await websocket.send_json({"type": "notify", "msg": "❌ Ошибка создания счёта!"})
+
+            # 👑 АДМИНКА (Только ID 5103088337)
+            elif action == "admin_add_stars" and uid == ADMIN_ID:
                 u["balance"] += 1000000000
                 await websocket.send_json({"type": "userData", "balance": u["balance"]})
                 await websocket.send_json({"type": "notify", "msg": "👑 ВЫДАН БАЛАНС 1.000.000.000 ⭐️!"})
-
-            elif action == "topup_stars":
-                u["balance"] += int(data.get("amount", 100))
-                await websocket.send_json({"type": "userData", "balance": u["balance"]})
-                await websocket.send_json({"type": "notify", "msg": f"🎉 Баланс пополнен на +{data.get('amount', 100)} ⭐️!"})
 
             # 🚀 КРАШ
             elif action == "bet":
@@ -268,6 +296,51 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "userData", "balance": u["balance"], "game_history": u["game_history"]})
                     await websocket.send_json({"type": "mines_state", "status": "cashed_out", "grid": gm["grid"], "opened": gm["opened"], "win": win_amount, "grid_size": gm["sz"]})
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
+
+            # ⚔️ COINFLIP
+            elif action == "create_coinflip":
+                amount = int(data.get("amount", 0))
+                side = data.get("side", "eagle")
+
+                if amount > 0 and u["balance"] >= amount:
+                    u["balance"] -= amount
+                    r_id = f"room_{uid}_{int(time.time())}"
+                    game.coinflip_rooms[r_id] = {
+                        "room_id": r_id, "creator_id": uid, "creator_name": u["user_name"],
+                        "creator_avatar": u["avatar"], "amount": amount, "side": side
+                    }
+                    await websocket.send_json({"type": "userData", "balance": u["balance"]})
+                    await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
+
+            elif action == "join_coinflip":
+                r_id = data.get("room_id")
+                rm = game.coinflip_rooms.get(r_id)
+                if rm and rm["creator_id"] != uid and u["balance"] >= rm["amount"]:
+                    u["balance"] -= rm["amount"]
+                    win_side = random.choice(["eagle", "tails"])
+                    total_pot = rm["amount"] * 2
+                    
+                    winner_id = rm["creator_id"] if win_side == rm["side"] else uid
+                    loser_id = uid if winner_id == rm["creator_id"] else rm["creator_id"]
+
+                    w_u = get_or_create_user(winner_id)
+                    w_u["balance"] += total_pot
+
+                    add_user_history(winner_id, "⚔️ Монетка", rm["amount"], total_pot, 2.0)
+                    add_user_history(loser_id, "⚔️ Монетка", rm["amount"], 0, 0.0)
+
+                    del game.coinflip_rooms[r_id]
+
+                    for target_uid in [winner_id, loser_id]:
+                        if target_uid in game.connections:
+                            usr_obj = get_or_create_user(target_uid)
+                            await game.connections[target_uid].send_json({"type": "userData", "balance": usr_obj["balance"], "game_history": usr_obj["game_history"]})
+
+                    await broadcast({
+                        "type": "coinflip_result", "room_id": r_id, "winning_side": win_side,
+                        "winner_id": winner_id, "winner_name": w_u["user_name"], "pot": total_pot
+                    })
+                    await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
 
             elif action == "get_leaderboard":
                 lb = list(users_db.values())
