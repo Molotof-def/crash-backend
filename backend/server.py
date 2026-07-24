@@ -51,14 +51,16 @@ for col in [
     except:
         pass
 
+# 🚀 КЭШ ИСТОРИИ В ПАМЯТИ (Исключает зависания диска!)
+cursor.execute("SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT 50")
+crash_history_cache = [r[0] for r in cursor.fetchall()]
+
 def save_crash_result(mult: float):
+    global crash_history_cache
     cursor.execute("INSERT INTO crash_history (multiplier, timestamp) VALUES (?, ?)", (mult, int(time.time())))
     conn.commit()
-
-def get_recent_history(limit=50):
-    cursor.execute("SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT ?", (limit,))
-    rows = cursor.fetchall()
-    return [r[0] for r in rows]
+    crash_history_cache.insert(0, mult)
+    crash_history_cache = crash_history_cache[:50]
 
 def get_or_create_user(user_id: int, user_name: str = None, avatar: str = None):
     cursor.execute("SELECT balance, balance_ton, inventory, last_daily, user_name, avatar, total_games, max_win, total_profit, custom_title, frame_color, total_mines_x, game_history FROM users WHERE user_id = ?", (user_id,))
@@ -189,7 +191,8 @@ async def crash_loop():
                 "state": "idle", 
                 "multiplier": 1.0, 
                 "time_left": time_left, 
-                "bets": game.active_bets
+                "bets": game.active_bets,
+                "history": crash_history_cache
             })
             await asyncio.sleep(0.1)
 
@@ -248,11 +251,11 @@ async def crash_loop():
                 "state": game.state, 
                 "multiplier": game.multiplier, 
                 "bets": game.active_bets,
-                "history": get_recent_history()
+                "history": crash_history_cache
             })
             if game.state == "crashed":
                 break
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.12)
 
         await asyncio.sleep(2.5)
 
@@ -345,7 +348,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     })
     await websocket.send_json({"type": "chat_history", "messages": game.chat_messages})
     await websocket.send_json({"type": "leaderboard", "data": get_leaderboard()})
-    await websocket.send_json({"type": "crash_history_init", "history": get_recent_history()})
+    await websocket.send_json({"type": "crash_history_init", "history": crash_history_cache})
     await websocket.send_json({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
 
     try:
@@ -492,7 +495,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     sym = "💎" if curr=="ton" else "⭐️"
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} {sym} ({mult}x)!"})
 
-            # --- ⚔️ PVP COINFLIP ---
             elif action == "create_coinflip":
                 amount = float(data.get("amount", 0))
                 currency = data.get("currency", "stars")
@@ -567,7 +569,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         })
                         await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
 
-            # --- 🥏 PVP КАРТА ЗОН ---
             elif action == "jackpot_bet":
                 amount = float(data.get("amount", 0))
                 currency = data.get("currency", "stars")
