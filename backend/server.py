@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-BOT_TOKEN = "ВАШ_ТОКЕН_БОТА" # Тот же токен, что и в bot.py
+BOT_TOKEN = "8945990343:AAEteeBQgW_qYc3QtvndTxvu58bcUf_OqIA"
 ADMIN_ID = "5103088337"
 
 app = FastAPI()
