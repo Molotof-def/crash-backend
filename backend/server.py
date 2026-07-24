@@ -155,7 +155,7 @@ async def broadcast(message: dict):
         except:
             pass
 
-# 🚀 РАКЕТА: ТАЙМЕР И ИКСЫ
+# 🚀 РАКЕТА: ТАЙМЕР + LIVE СТАВКИ
 async def crash_loop():
     while True:
         game.state = "idle"
@@ -418,7 +418,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "mines_state", "status": "cashed_out", "grid": m_game["grid"], "opened": m_game["opened"], "mult": mult, "next_mult": 0, "win": win_amount, "grid_size": m_game["grid_size"]})
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} ⭐️ ({mult}x)!"})
 
-            # --- ⚔️ PVP МОНЕТКА (COINFLIP) ---
+            # --- ⚔️ PVP COINFLIP ---
             elif action == "create_coinflip":
                 amount = data.get("amount", 0)
                 side = data.get("side", "eagle")
@@ -471,7 +471,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     })
                     await broadcast({"type": "coinflip_rooms", "rooms": list(game.coinflip_rooms.values())})
 
-            # --- 🥏 PVP КАРТА ЗОН (JACKPOT) ---
+            # --- 🥏 PVP КАРТА ЗОН ---
             elif action == "jackpot_bet":
                 amount = data.get("amount", 0)
                 b, inv, ld, _, _, tg, mw, tp, ct, fc, tmx = get_or_create_user(user_id, user_name, avatar)
@@ -492,7 +492,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     await websocket.send_json({"type": "userData", "balance": new_bal, "inventory": inv, "stats": {"total_games": tg, "max_win": mw, "total_profit": tp, "total_mines_x": tmx}, "custom_title": ct, "frame_color": fc})
                     await broadcast({"type": "jackpot_update", "state": "idle", "bets": game.jackpot_bets, "timer": game.jackpot_timer})
 
-            # --- 💬 СЕРВИСЫ (ПРОМО, ЧАТ, ТОП, ПОПОЛНЕНИЕ) ---
+            # --- 💬 СЕРВИСЫ ---
             elif action == "use_promo":
                 code = data.get("code", "").strip().lower()
                 b, inv, ld, _, _, tg, mw, tp, ct, fc, tmx = get_or_create_user(user_id)
