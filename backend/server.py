@@ -15,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ⚡️ БАЗА ДАННЫХ В ОПЕРАТИВНОЙ ПАМЯТИ (RAM) - 0 МС ЗАДЕРЖКИ
+# ⚡️ БАЗА ДАННЫХ В ОПЕРАТИВНОЙ ПАМЯТИ (RAM)
 users_db = {}
 crash_history_ram = [1.25, 3.40, 1.10, 5.50, 2.10, 1.05]
 
@@ -79,7 +79,7 @@ async def broadcast(message: dict):
         except:
             pass
 
-# 🚀 РАКЕТА (КРАШ) В REAL-TIME
+# 🚀 АСИНХРОННЫЙ ЛУП КРАША
 async def crash_loop():
     while True:
         game.state = "idle"
@@ -121,7 +121,6 @@ async def crash_loop():
         crash_history_ram.insert(0, game.target_crash)
         if len(crash_history_ram) > 50: crash_history_ram.pop()
 
-        # Сгоревшие ставки
         for uid, bet in list(game.active_bets.items()):
             if bet["status"] == "playing":
                 bet["status"] = "crashed"
@@ -222,7 +221,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 await websocket.send_json({"type": "notify", "msg": f"🎯 Забрал {win_amount} {sym}! ({current_mult}x)"})
                 await broadcast({"type": "bets_update", "bets": game.active_bets})
 
-            # === 💣 МИНЫ ===
+            # === 💣 МИНЫ (ПОЧИНЕН ИНДЕКС И ВИЗУАЛ) ===
             elif action == "mines_start":
                 bet = float(data.get("bet", 0))
                 curr = data.get("currency", "stars")
@@ -247,7 +246,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     }
 
                     await websocket.send_json({"type": "userData", "balance": u["balance"], "balance_ton": u["balance_ton"]})
-                    await websocket.send_json({"type": "mines_state", "status": "playing", "opened": [], "mult": 1.0, "next_mult": next_m, "win": 0, "grid_size": grid_sz})
+                    await websocket.send_json({"type": "mines_state", "status": "playing", "opened": [], "grid": [], "mult": 1.0, "next_mult": next_m, "win": 0, "grid_size": grid_sz})
 
             elif action == "mines_open":
                 idx = data.get("cell")
@@ -256,11 +255,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     curr = gm["curr"]
                     if gm["grid"][idx] == "mine":
                         gm["status"] = "crashed"
+                        all_opened = list(set(gm["opened"] + [idx]))
                         sym = "💎" if curr == "ton" else "⭐️"
                         add_user_history(uid, "💣 Мины", gm["bet"], 0, 0.0, sym)
                         
                         await websocket.send_json({"type": "userData", "balance": u["balance"], "balance_ton": u["balance_ton"], "game_history": u["game_history"]})
-                        await websocket.send_json({"type": "mines_state", "status": "crashed", "grid": gm["grid"], "opened": gm["opened"] + [idx]})
+                        # Передаем полную сетку и статус ВЗРЫВА
+                        await websocket.send_json({"type": "mines_state", "status": "crashed", "grid": gm["grid"], "opened": all_opened, "grid_size": gm["sz"]})
                     else:
                         gm["opened"].append(idx)
                         opened_cnt = len(gm["opened"])
@@ -274,7 +275,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                         next_mult = round(next_mult * 0.96, 2)
 
                         win = round(gm["bet"] * mult, 2)
-                        await websocket.send_json({"type": "mines_state", "status": "playing", "opened": gm["opened"], "mult": mult, "next_mult": next_mult, "win": win})
+                        await websocket.send_json({"type": "mines_state", "status": "playing", "opened": gm["opened"], "grid": [], "mult": mult, "next_mult": next_mult, "win": win, "grid_size": gm["sz"]})
 
             elif action == "mines_cashout":
                 gm = game.mines_games.get(uid)
@@ -296,7 +297,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     add_user_history(uid, "💣 Мины", gm["bet"], win_amount, mult, sym)
                     
                     await websocket.send_json({"type": "userData", "balance": u["balance"], "balance_ton": u["balance_ton"], "game_history": u["game_history"]})
-                    await websocket.send_json({"type": "mines_state", "status": "cashed_out", "grid": gm["grid"], "win": win_amount})
+                    await websocket.send_json({"type": "mines_state", "status": "cashed_out", "grid": gm["grid"], "opened": gm["opened"], "win": win_amount, "grid_size": gm["sz"]})
                     await websocket.send_json({"type": "notify", "msg": f"💣 МИНЫ: Забрал +{win_amount} {sym} ({mult}x)!"})
 
             # === ⚔️ COINFLIP ===
